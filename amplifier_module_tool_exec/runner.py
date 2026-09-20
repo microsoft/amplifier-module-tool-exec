@@ -81,7 +81,10 @@ class ProgrammaticTool:
         "to return selected output. tools.available lists names. Each call returns "
         "{status, success, output, source}. No Node, filesystem, network, or persistent state. "
         "Nested calls keep normal approvals. Await every call; failed/denied calls remain "
-        "visible in authoritative receipts. Delegation, background work, and recursion are unsupported."
+        "visible in authoritative receipts. output retains the delegated tool's structured "
+        "type: inspect its fields rather than assuming it is a string. Calls can succeed "
+        "before later JavaScript fails; inspect receipts before retrying. "
+        "Delegation, background work, and recursion are unsupported."
     )
 
     def __init__(self, coordinator, config=None):
