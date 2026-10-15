@@ -87,6 +87,20 @@ also includes a stable `error.code` and message. Examples include
 `argument_limit`, `result_limit`, `output_limit`, `unawaited_calls`, `timeout`,
 `javascript_error`, and `nested_call_failed`.
 
+`output_delivery` separately reports whether the selected text was delivered
+completely. `output_limit` means printing exceeded the configured budget; it does
+not change a confirmed child outcome into unknown. `calls[].result_delivery`
+reports delivery to JavaScript (`delivered`, `omitted_limit`, or `failed`),
+separately from the host-confirmed `status` and `success`. A transport or encoding
+failure after a confirmed host outcome uses `result_delivery_failed` and preserves
+that outcome. The outer program still fails when its output is incomplete: do not
+use partial printed text as complete evidence.
+
+Recover by reading an existing domain receipt or paging a read and selecting the
+needed fields. Never rerun a mutation solely to print a smaller result. This module
+does not add a persistent result store; host/domain receipts remain the recovery
+authority, and genuinely uncertain execution remains unknown.
+
 Caller cancellation delivered to this tool propagates. An optional host lease
 `wait_cancelled()` signal also stops execution when the real host immediate-cancel
 token or lease ownership changes; cancellation of only a foreign-runtime awaiter

@@ -224,6 +224,59 @@ async def test_unknown_outcome_stays_unknown():
     assert result.output["calls"][0]["success"] is None
 
 
+async def test_print_overflow_does_not_turn_confirmed_mutation_into_unknown():
+    effects = []
+
+    async def mutate(*_):
+        effects.append("saved")
+        return {"status": "completed", "success": True,
+                "output": {"id": "saved-result", "details": "x" * 33000}}
+
+    instance, lease = tool(lease=Lease(mutate))
+    result = await instance.execute({"code": "text(await tools.other({}))"})
+    assert not result.success and result.error["code"] == "output_limit"
+    assert effects == ["saved"] and len(lease.calls) == 1
+    assert result.output["output_delivery"] == {"status": "incomplete", "reason": "output_limit"}
+    receipt, = result.output["calls"]
+    assert receipt["status"] == "completed" and receipt["success"] is True
+    assert receipt["result_delivery"] == "delivered"
+    assert "do not replay mutations" in result.error["message"]
+
+
+async def test_serialization_failure_preserves_confirmed_child_outcome():
+    async def non_json(*_):
+        return {"status": "completed", "success": True, "output": {"value": object()}}
+
+    instance, _ = tool(lease=Lease(non_json))
+    result = await instance.execute({"code": "text(await tools.other({}))"})
+    assert not result.success and result.error["code"] == "result_delivery_failed"
+    receipt, = result.output["calls"]
+    assert receipt["status"] == "completed" and receipt["success"] is True
+    assert receipt["result_delivery"] == "failed"
+
+
+async def test_print_overflow_does_not_promote_unknown_mutation():
+    async def uncertain(*_):
+        return {"status": "unknown", "success": None, "output": "x" * 33000}
+
+    instance, _ = tool(lease=Lease(uncertain))
+    result = await instance.execute({"code": "text(await tools.other({}))"})
+    assert not result.success and result.error["code"] == "output_limit"
+    receipt, = result.output["calls"]
+    assert receipt["status"] == "unknown" and receipt["success"] is None
+
+
+async def test_complete_printed_output_is_distinct_from_denied_call():
+    async def denied(*_):
+        return {"status": "denied", "success": False, "output": "denied"}
+
+    instance, _ = tool(lease=Lease(denied))
+    result = await instance.execute({"code": "text(await tools.other({}))"})
+    assert not result.success
+    assert result.output["output_delivery"] == {"status": "complete", "reason": None}
+    assert result.output["calls"][0]["status"] == "denied"
+
+
 async def test_cancellation_stops_worker_and_propagates_to_nested_call():
     started, cancelled = asyncio.Event(), asyncio.Event()
 

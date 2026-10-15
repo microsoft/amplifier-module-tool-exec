@@ -84,6 +84,9 @@ class ProgrammaticTool:
         "visible in authoritative receipts. output retains the delegated tool's structured "
         "type: inspect its fields rather than assuming it is a string. Calls can succeed "
         "before later JavaScript fails; inspect receipts before retrying. "
+        "output_delivery describes printed-text delivery separately from calls[].status. "
+        "On output_limit select fewer fields or page the source read; never repeat a "
+        "mutation merely to print its result again. "
         "Delegation, background work, and recursion are unsupported."
     )
 
@@ -231,16 +234,16 @@ class ProgrammaticTool:
                             "dispatch_contract",
                             "Host result lacks matching call attribution",
                         )
-                    encoded = json.dumps(response, ensure_ascii=False).encode("utf-8")
-                    size = len(encoded)
                     receipt.update(
                         {
                             "status": response["status"],
                             "success": response.get("success"),
                             "source": response.get("source"),
-                            "result_bytes": size,
                         }
                     )
+                    encoded = json.dumps(response, ensure_ascii=False).encode("utf-8")
+                    size = len(encoded)
+                    receipt["result_bytes"] = size
                     if (
                         size > limits.max_result_bytes
                         or result_bytes + size > limits.max_total_result_bytes
@@ -252,6 +255,7 @@ class ProgrammaticTool:
                         )
                     result_bytes += size
                     await send({"request_id": frame["request_id"], "result": response})
+                    receipt["result_delivery"] = "delivered"
             except asyncio.CancelledError:
                 # The underlying tool may have already made effects. Do not
                 # relabel interruption as denied, success, or rolled back.
@@ -262,23 +266,34 @@ class ProgrammaticTool:
                         cancellation="requested",
                         effects="not_rolled_back",
                     )
+                elif "result_delivery" not in receipt:
+                    receipt["result_delivery"] = "failed"
                 raise
             except ExecutionFailure as exc:
                 if receipt["status"] in {"queued", "dispatching"}:
                     receipt.update(
                         status="unknown", success=None, effects="not_rolled_back"
                     )
+                elif "result_delivery" not in receipt:
+                    receipt["result_delivery"] = "failed"
                 if not fatal.done():
                     fatal.set_result(exc)
             except Exception:
-                receipt.update(
-                    status="unknown", success=None, effects="not_rolled_back"
-                )
+                confirmed = receipt["status"] not in {"queued", "dispatching"}
+                if confirmed:
+                    # Encoding or worker transport can fail after the host has
+                    # returned an authoritative outcome. Do not erase it.
+                    receipt["result_delivery"] = "failed"
+                else:
+                    receipt.update(
+                        status="unknown", success=None, effects="not_rolled_back"
+                    )
                 if not fatal.done():
                     fatal.set_result(
                         ExecutionFailure(
-                            "dispatch_failed",
-                            "Nested dispatch failed without a confirmed outcome",
+                            "result_delivery_failed" if confirmed else "dispatch_failed",
+                            "Host returned a confirmed outcome but its result could not be delivered to JavaScript"
+                            if confirmed else "Nested dispatch failed without a confirmed outcome",
                         )
                     )
 
@@ -385,7 +400,10 @@ class ProgrammaticTool:
                         or len(output) >= limits.max_output_items
                     ):
                         raise ExecutionFailure(
-                            "output_limit", "Selected output exceeds configured limits"
+                            "output_limit", "Selected text exceeds configured limits. "
+                            "Confirmed child outcomes remain in calls; this is an output delivery failure, "
+                            "not evidence that completed work failed or became unknown. "
+                            "Read retained domain state or page a read; do not replay mutations to print less."
                         )
                     output.append(value)
                 elif kind == "done":
@@ -465,12 +483,15 @@ class ProgrammaticTool:
                     if call in pending:
                         for receipt in receipts:
                             if receipt["request_id"] == identity:
-                                receipt.update(
-                                    status="unknown",
-                                    cancellation="unconfirmed",
-                                    success=None,
-                                    effects="not_rolled_back",
-                                )
+                                if receipt["status"] in {"queued", "dispatching", "unknown"}:
+                                    receipt.update(
+                                        status="unknown",
+                                        cancellation="unconfirmed",
+                                        success=None,
+                                        effects="not_rolled_back",
+                                    )
+                                else:
+                                    receipt["result_delivery"] = "failed"
                         # A non-cooperative host tool cannot be forcibly killed
                         # here. Revoke authority, retain an honest receipt, and
                         # consume its eventual exception without blocking forever.
@@ -492,6 +513,10 @@ class ProgrammaticTool:
             "calls": receipts,
             "output_bytes": sum(len(item.encode()) for item in output),
             "nested_result_bytes": result_bytes,
+            "output_delivery": {
+                "status": "incomplete" if failure is not None else "complete",
+                "reason": failure.code if failure is not None else None,
+            },
             "effects": "not_rolled_back",
             "limits": asdict(limits),
         }
