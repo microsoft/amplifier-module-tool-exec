@@ -56,7 +56,19 @@ long-lived execution or delegation under different names.
 
 All limits are host configuration, not script arguments. The wall deadline includes
 approval waits; hosts can raise it within the documented maximum of 300 seconds
-when human review requires more time. Defaults:
+when human review requires more time. The mounted tool's description reports its
+effective configured deadline. A nested tool's longer timeout does not extend
+that deadline: a 60-second process wait inside a default 30-second program can
+time out before the wait finishes.
+
+Invoke longer passive waits directly through the appropriate tool's normal
+dispatcher, with an explicit supported timeout, instead of wrapping them in
+`tool_exec`. For example, ordinary Bash execution can await command completion;
+managed Bash `wait` instead returns on new output or completion. Keep routine
+monitor progress in a task-owned bounded log and return a bounded terminal
+summary, then inspect the exact external job's completion receipt. Preserve
+cancellation and unknown outcomes; neither a timeout nor a detached process
+implies the watched job finished. Defaults:
 
 | Setting | Default |
 | --- | ---: |
