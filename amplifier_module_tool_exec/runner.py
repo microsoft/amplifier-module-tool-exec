@@ -93,6 +93,12 @@ class ProgrammaticTool:
     def __init__(self, coordinator, config=None):
         self.coordinator = coordinator
         self.limits = Limits.from_config(config or {})
+        self.description = (
+            f"Wall-clock budget: {self.limits.timeout_seconds:g} seconds total, including "
+            "approval and nested tool waits. Nested timeouts do not extend it. "
+            "Invoke longer passive waits directly through their tool. "
+            + self.description
+        )
         self._active = 0
 
     @property
