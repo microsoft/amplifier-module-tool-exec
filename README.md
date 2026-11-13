@@ -2,9 +2,9 @@
 
 `tool-exec` mounts the `tool_exec` tool. It runs a fresh, bounded JavaScript program
 that calls already-mounted tools through the host's **approved dispatch lease**.
-Only explicit `text()` output and an authoritative call receipt list return to the
-model. This is useful when a task needs selected fields from several large tool
-results.
+Explicit `text()` output, an authoritative call receipt list, and eligible
+structured media references return to the model. This is useful when a task needs
+selected fields from several large tool results.
 
 ```javascript
 const results = await Promise.all([
@@ -100,6 +100,29 @@ Recover by reading an existing domain receipt or paging a read and selecting the
 needed fields. Never rerun a mutation solely to print a smaller result. This module
 does not add a persistent result store; host/domain receipts remain the recovery
 authority, and genuinely uncertain execution remains unknown.
+
+### Structured media references
+
+For media-aware hosts, the tool also aggregates direct
+`output["experimental.media.v1"] = {"refs": [...]}` carriers from the actual
+post-hook nested dispatch response into its own `ToolResult.output` namespace.
+Only confirmed successful calls whose bounded result was delivered to JavaScript
+contribute refs. Order and multiplicity follow invocation order, not completion
+order. No `text()` call is required; strings that look like JSON, nested dictionaries
+and printed text are never searched for media.
+
+The carrier accepts the closed session-owned v1 PNG/JPEG reference shape, not
+pixels, URLs or filesystem paths. A malformed reserved carrier fails result
+delivery with `invalid_media_result` without changing the confirmed child outcome.
+The existing nested-result byte budgets include refs; oversized or undeliverable
+results do not contribute them. Successful returned refs survive a later script,
+text-output or host-cancellation failure independently of `output_delivery`.
+Caller task cancellation still propagates rather than fabricating a result.
+
+The module does not resolve, hydrate, publish or commit media, refresh expiry, or
+grant access. Hosts must validate ownership and the effective nested result; the
+outer `tool:post` chain may still redact the aggregate before canonical acceptance.
+See the [dispatch contract](docs/dispatch-contract.md) for the integration boundary.
 
 Caller cancellation delivered to this tool propagates. An optional host lease
 `wait_cancelled()` signal also stops execution when the real host immediate-cancel

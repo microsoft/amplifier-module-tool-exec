@@ -2,8 +2,10 @@
 
 import asyncio
 import json
+import re
 import sys
 from dataclasses import asdict, dataclass, fields
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -12,6 +14,78 @@ from amplifier_core import ToolResult
 
 MAX_WIRE_BYTES = 2 * 1024 * 1024
 FORBIDDEN_TOOLS = {"tool_exec", "delegate", "task", "live_job"}
+MEDIA_NAMESPACE = "experimental.media.v1"
+REF_FIELDS = {
+    "v", "session_id", "sha256", "mime", "bytes", "width", "height", "provenance"
+}
+PROVENANCE_FIELDS = {"kind", "session_id", "id", "created_at", "expires_at"}
+SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,220}")
+
+
+def _returned_media_refs(output, session_id):
+    """Check the closed ref-only wire shape, not storage ownership or authority.
+
+    The dispatch owner validates/stages the effective result. The outer post-hook
+    and media owner still decide publication; possession of these refs grants no
+    ability to read pixels. Never inspect text or recursively search other fields.
+    """
+    if not isinstance(output, dict) or MEDIA_NAMESPACE not in output:
+        return []
+    envelope = output[MEDIA_NAMESPACE]
+    try:
+        if (
+            not isinstance(envelope, dict)
+            or set(envelope) != {"refs"}
+            or not isinstance(envelope["refs"], list)
+        ):
+            raise ValueError
+        for ref in envelope["refs"]:
+            if (
+                not isinstance(ref, dict)
+                or set(ref) != REF_FIELDS
+                or type(ref["v"]) is not int
+                or ref["v"] != 1
+                or ref["session_id"] != session_id
+                or not isinstance(ref["session_id"], str)
+                or not SESSION_ID.fullmatch(ref["session_id"])
+                or not isinstance(ref["sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", ref["sha256"])
+                or ref["mime"] not in ("image/png", "image/jpeg")
+                or any(
+                    type(ref[key]) is not int or ref[key] <= 0
+                    for key in ("bytes", "width", "height")
+                )
+            ):
+                raise ValueError
+            origin = ref["provenance"]
+            if (
+                not isinstance(origin, dict)
+                or set(origin) != PROVENANCE_FIELDS
+                or origin["kind"] not in ("tool", "upload", "host", "migration")
+                or not isinstance(origin["session_id"], str)
+                or not SESSION_ID.fullmatch(origin["session_id"])
+                or not isinstance(origin["id"], str)
+                or not origin["id"]
+            ):
+                raise ValueError
+            created = datetime.fromisoformat(origin["created_at"])
+            expires = (
+                datetime.fromisoformat(origin["expires_at"])
+                if origin["expires_at"] is not None else None
+            )
+            if (
+                created.tzinfo is None
+                or (expires is not None and (
+                    expires.tzinfo is None or expires < created
+                ))
+            ):
+                raise ValueError
+    except (TypeError, ValueError):
+        raise ExecutionFailure(
+            "invalid_media_result",
+            "Host returned an invalid ref-only media carrier; no media was promoted",
+        ) from None
+    return envelope["refs"]
 
 
 @dataclass(frozen=True)
@@ -85,6 +159,7 @@ class ProgrammaticTool:
         "type: inspect its fields rather than assuming it is a string. Calls can succeed "
         "before later JavaScript fails; inspect receipts before retrying. "
         "output_delivery describes printed-text delivery separately from calls[].status. "
+        "Eligible structured media refs return separately; printing JSON never adds media. "
         "On output_limit select fewer fields or page the source read; never repeat a "
         "mutation merely to print its result again. "
         "Delegation, background work, and recursion are unsupported."
@@ -162,6 +237,7 @@ class ProgrammaticTool:
         cancellation = None
         calls = {}
         receipts = []
+        returned_refs = {}
         output = []
         output_bytes = result_bytes = 0
         fatal = asyncio.get_running_loop().create_future()
@@ -254,8 +330,19 @@ class ProgrammaticTool:
                             "Nested result exceeds configured limits; narrow the tool request",
                         )
                     result_bytes += size
+                    # Decode our own bounded transport serialization, not any
+                    # tool output string. Detach from host-owned mutable results.
+                    response = json.loads(encoded)
+                    refs = (
+                        _returned_media_refs(
+                            response.get("output"), lease.context["session_id"]
+                        )
+                        if receipt["status"] == "completed" else []
+                    )
                     await send({"request_id": frame["request_id"], "result": response})
                     receipt["result_delivery"] = "delivered"
+                    if refs:
+                        returned_refs[frame["request_id"]] = refs
             except asyncio.CancelledError:
                 # The underlying tool may have already made effects. Do not
                 # relabel interruption as denied, success, or rolled back.
@@ -520,6 +607,17 @@ class ProgrammaticTool:
             "effects": "not_rolled_back",
             "limits": asdict(limits),
         }
+        # Receipt order is invocation order even when calls complete in reverse.
+        # Keep successful returned refs on later script/text failure, independently
+        # of execution status. Omitted/failed/unknown deliveries contribute none.
+        refs = [
+            ref
+            for receipt in receipts
+            if receipt.get("result_delivery") == "delivered"
+            for ref in returned_refs.get(receipt["request_id"], ())
+        ]
+        if refs:
+            result[MEDIA_NAMESPACE] = {"refs": refs}
         if not success:
             failure = failure or ExecutionFailure(
                 "nested_call_failed", "One or more nested calls did not confirm success"
