@@ -238,6 +238,7 @@ class ProgrammaticTool:
         calls = {}
         receipts = []
         returned_refs = {}
+        pending_delivery = {}
         output = []
         output_bytes = result_bytes = 0
         fatal = asyncio.get_running_loop().create_future()
@@ -339,10 +340,11 @@ class ProgrammaticTool:
                         )
                         if receipt["status"] == "completed" else []
                     )
+                    pending_delivery[frame["request_id"]] = (receipt, refs)
                     await send({"request_id": frame["request_id"], "result": response})
-                    receipt["result_delivery"] = "delivered"
-                    if refs:
-                        returned_refs[frame["request_id"]] = refs
+                    # A successful pipe drain is only enqueueing. The trusted
+                    # worker must ACK successful QuickJS ingestion before we
+                    # mark delivery or let the refs reach the outer result.
             except asyncio.CancelledError:
                 # The underlying tool may have already made effects. Do not
                 # relabel interruption as denied, success, or rolled back.
@@ -367,10 +369,12 @@ class ProgrammaticTool:
                     fatal.set_result(exc)
             except Exception:
                 confirmed = receipt["status"] not in {"queued", "dispatching"}
+                delivered = receipt.get("result_delivery") == "delivered"
                 if confirmed:
                     # Encoding or worker transport can fail after the host has
                     # returned an authoritative outcome. Do not erase it.
-                    receipt["result_delivery"] = "failed"
+                    if not delivered:
+                        receipt["result_delivery"] = "failed"
                 else:
                     receipt.update(
                         status="unknown", success=None, effects="not_rolled_back"
@@ -378,8 +382,11 @@ class ProgrammaticTool:
                 if not fatal.done():
                     fatal.set_result(
                         ExecutionFailure(
-                            "result_delivery_failed" if confirmed else "dispatch_failed",
-                            "Host returned a confirmed outcome but its result could not be delivered to JavaScript"
+                            "worker_transport_failed" if delivered
+                            else "result_delivery_failed" if confirmed else "dispatch_failed",
+                            "Worker transport failed after acknowledged JavaScript delivery"
+                            if delivered
+                            else "Host returned a confirmed outcome but its result could not be delivered to JavaScript"
                             if confirmed else "Nested dispatch failed without a confirmed outcome",
                         )
                     )
@@ -409,6 +416,11 @@ class ProgrammaticTool:
                         read.cancel()
                         await asyncio.gather(read, return_exceptions=True)
                 if not line:
+                    if pending_delivery:
+                        raise ExecutionFailure(
+                            "result_delivery_failed",
+                            "Worker exited before acknowledging JavaScript result ingestion",
+                        )
                     raise ExecutionFailure(
                         "worker_failed",
                         "JavaScript worker exited without a complete result",
@@ -475,6 +487,16 @@ class ProgrammaticTool:
                     }
                     receipts.append(receipt)
                     calls[identity] = asyncio.create_task(invoke(frame, receipt))
+                elif kind == "result_received":
+                    identity = frame.get("request_id")
+                    if not isinstance(identity, str) or identity not in pending_delivery:
+                        raise ExecutionFailure(
+                            "protocol_error", "Unexpected or duplicate result acknowledgement"
+                        )
+                    receipt, refs = pending_delivery.pop(identity)
+                    receipt["result_delivery"] = "delivered"
+                    if refs:
+                        returned_refs[identity] = refs
                 elif kind == "text":
                     value = frame.get("value")
                     if not isinstance(value, str):
@@ -508,6 +530,11 @@ class ProgrammaticTool:
                         await asyncio.gather(*calls.values(), return_exceptions=True)
                     if fatal.done():
                         raise fatal.result()
+                    if pending_delivery:
+                        raise ExecutionFailure(
+                            "result_delivery_failed",
+                            "Worker finished before acknowledging JavaScript result ingestion",
+                        )
                     if frame.get("status") != "completed":
                         raise ExecutionFailure(
                             frame.get("code", "javascript_error"),
@@ -578,7 +605,8 @@ class ProgrammaticTool:
                                         effects="not_rolled_back",
                                     )
                                 else:
-                                    receipt["result_delivery"] = "failed"
+                                    if receipt.get("result_delivery") != "delivered":
+                                        receipt["result_delivery"] = "failed"
                         # A non-cooperative host tool cannot be forcibly killed
                         # here. Revoke authority, retain an honest receipt, and
                         # consume its eventual exception without blocking forever.
@@ -587,6 +615,9 @@ class ProgrammaticTool:
                         )
                     elif not call.cancelled():
                         call.exception()
+            for receipt, _ in pending_delivery.values():
+                if "result_delivery" not in receipt:
+                    receipt["result_delivery"] = "failed"
         success = (
             finished
             and failure is None

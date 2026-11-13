@@ -100,8 +100,18 @@ producer output. Never return original refs beside a redacted effective output.
 Text containing this spelling is still text, not a carrier.
 
 Tool-exec aggregates only attributed `completed` / `success: true` responses
-successfully delivered within the existing result byte limits. It snapshots the
-bounded wire data outside JavaScript, preserving ref order, inner provenance and
+successfully delivered within the existing result byte limits. Delivery is
+acknowledged by the trusted worker after QuickJS reply parsing and pending-call
+resolution, before script continuations run. A successful pipe drain alone is
+not delivery. Missing acknowledgement prevents promotion, preserves confirmed
+child outcomes and records failed result delivery. A later script failure after
+acknowledgement does not undo delivery. The script cannot emit acknowledgements
+through its call/text bridge; duplicate or unmatched acknowledgements fail closed.
+The top-level returned envelope has a null prototype so script-modified inherited
+thenables cannot intercept promise fulfillment; its JSON fields remain unchanged.
+Acknowledgement is result delivery, not proof the script used every field or saw
+pixels. Tool-exec snapshots the bounded wire data outside JavaScript, preserving
+ref order, inner provenance and
 original expiry. Failed, denied, unknown, oversized and undeliverable responses
 cannot contribute refs, even if the script prints success. Later program failure
 does not erase refs from completed delivered siblings or change their statuses.

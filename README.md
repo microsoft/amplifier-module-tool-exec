@@ -91,10 +91,16 @@ also includes a stable `error.code` and message. Examples include
 completely. `output_limit` means printing exceeded the configured budget; it does
 not change a confirmed child outcome into unknown. `calls[].result_delivery`
 reports delivery to JavaScript (`delivered`, `omitted_limit`, or `failed`),
-separately from the host-confirmed `status` and `success`. A transport or encoding
-failure after a confirmed host outcome uses `result_delivery_failed` and preserves
-that outcome. The outer program still fails when its output is incomplete: do not
-use partial printed text as complete evidence.
+separately from the host-confirmed `status` and `success`. `delivered` requires a
+trusted worker acknowledgement after QuickJS parses the reply and resolves its
+pending call, not merely a successful pipe write. A transport, encoding or
+receive-side ingestion failure after a confirmed host outcome uses
+`result_delivery_failed` and preserves that outcome. Missing acknowledgement on
+timeout or cancellation also prevents delivery/media promotion, without changing
+the timeout/cancellation reason. A transport failure after acknowledgement uses
+`worker_transport_failed` and does not revoke delivered evidence. The outer program
+still fails when its output is incomplete: do not use partial printed text as
+complete evidence.
 
 Recover by reading an existing domain receipt or paging a read and selecting the
 needed fields. Never rerun a mutation solely to print a smaller result. This module

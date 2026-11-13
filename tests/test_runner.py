@@ -750,6 +750,275 @@ async def test_failed_worker_delivery_cannot_promote_returned_refs(monkeypatch):
     assert receipt["result_delivery"] == "failed"
 
 
+@pytest.mark.parametrize("terminal", ["failed", "completed", "eof"])
+async def test_receive_side_failure_after_pipe_read_does_not_promote_refs(
+    monkeypatch, tmp_path, terminal
+):
+    from amplifier_module_tool_exec import runner
+
+    # The parent's pipe write/drain succeeds, but the receiver cannot ingest the
+    # reply into JavaScript. This models parse/heap failure before promise resolve.
+    worker = tmp_path / "receive_failure.py"
+    worker.write_text(
+        "import json, sys\n"
+        "json.loads(sys.stdin.readline())\n"
+        "print(json.dumps({'type':'call','request_id':'1','name':'read','arguments':{}}), flush=True)\n"
+        "json.loads(sys.stdin.readline())\n"
+        + (
+            f"print(json.dumps({{'type':'done','status':{terminal!r},'error':'receiver parse failed'}}), flush=True)\n"
+            if terminal != "eof" else ""
+        )
+    )
+    original = asyncio.create_subprocess_exec
+
+    async def replacement(*args, **kwargs):
+        return await original(args[0], "-I", str(worker), **kwargs)
+
+    async def returned(*_):
+        return {"status": "completed", "success": True, "output": media_output(media_ref())}
+
+    monkeypatch.setattr(runner.asyncio, "create_subprocess_exec", replacement)
+    instance, lease = tool(lease=Lease(returned))
+    result = await instance.execute({"code": "await tools.read({})"})
+    assert not result.success
+    receipt, = result.output["calls"]
+    assert receipt["status"] == "completed" and receipt["success"] is True
+    assert receipt["result_delivery"] == "failed"
+    assert MEDIA_NAMESPACE not in result.output
+    assert result.error["code"] == "result_delivery_failed"
+    assert len(lease.calls) == 1 and lease.closed
+
+
+async def test_real_quickjs_receive_heap_failure_never_acknowledges_or_promotes_refs():
+    async def returned(*_):
+        return {
+            "status": "completed", "success": True,
+            "output": media_output(media_ref(), records=[{"value": 0}] * 15000),
+        }
+
+    instance, lease = tool({"memory_bytes": 2 * 1024 * 1024}, Lease(returned))
+    result = await instance.execute({"code": "await tools.read({})"})
+    assert not result.success
+    assert result.error["code"] == "result_delivery_failed"
+    assert "JSException" in result.error.get("message", "") or (
+        "acknowledging" in result.error["message"]
+    )
+    receipt, = result.output["calls"]
+    assert receipt["status"] == "completed" and receipt["success"] is True
+    assert receipt["result_delivery"] == "failed"
+    assert MEDIA_NAMESPACE not in result.output
+    assert len(lease.calls) == 1 and lease.closed
+
+
+@pytest.mark.parametrize("stop", ["timeout", "host_cancelled"])
+async def test_missing_ack_on_timeout_or_host_cancel_does_not_promote_refs(
+    monkeypatch, tmp_path, stop
+):
+    from amplifier_module_tool_exec import runner
+
+    worker = tmp_path / "stalled_receive.py"
+    worker.write_text(
+        "import json, sys, time\n"
+        "json.loads(sys.stdin.readline())\n"
+        "print(json.dumps({'type':'call','request_id':'1','name':'read','arguments':{}}), flush=True)\n"
+        "json.loads(sys.stdin.readline())\n"
+        "print(json.dumps({'type':'text','value':'receiver stalled before ingestion'}), flush=True)\n"
+        "time.sleep(30)\n"
+    )
+    original = asyncio.create_subprocess_exec
+    received, cancel = asyncio.Event(), asyncio.Event()
+
+    class ObserveRead:
+        def __init__(self, stream):
+            self.stream = stream
+
+        async def readline(self):
+            line = await self.stream.readline()
+            if b"receiver stalled" in line:
+                received.set()
+            return line
+
+    async def replacement(*args, **kwargs):
+        process = await original(args[0], "-I", str(worker), **kwargs)
+        process.stdout = ObserveRead(process.stdout)
+        return process
+
+    async def returned(*_):
+        return {"status": "completed", "success": True, "output": media_output(media_ref())}
+
+    monkeypatch.setattr(runner.asyncio, "create_subprocess_exec", replacement)
+    lease = Lease(returned)
+    lease.wait_cancelled = cancel.wait
+    instance, _ = tool({"timeout_seconds": 0.5 if stop == "timeout" else 5}, lease)
+    task = asyncio.create_task(instance.execute({"code": "await tools.read({})"}))
+    await asyncio.wait_for(received.wait(), 2)
+    if stop == "host_cancelled":
+        cancel.set()
+    result = await asyncio.wait_for(task, 2)
+    assert not result.success and result.error["code"] == stop
+    receipt, = result.output["calls"]
+    assert receipt["status"] == "completed" and receipt["success"] is True
+    assert receipt["result_delivery"] == "failed"
+    assert MEDIA_NAMESPACE not in result.output
+    assert len(lease.calls) == 1 and lease.closed
+
+
+@pytest.mark.parametrize("ack_id", ["other", None, [], 1])
+async def test_acknowledgement_requires_matching_pending_request(monkeypatch, tmp_path, ack_id):
+    from amplifier_module_tool_exec import runner
+
+    worker = tmp_path / "invalid_ack.py"
+    worker.write_text(
+        "import json, sys\n"
+        "json.loads(sys.stdin.readline())\n"
+        f"print({json.dumps(json.dumps({'type': 'result_received', 'request_id': ack_id}))}, flush=True)\n"
+    )
+    original = asyncio.create_subprocess_exec
+
+    async def replacement(*args, **kwargs):
+        return await original(args[0], "-I", str(worker), **kwargs)
+
+    monkeypatch.setattr(runner.asyncio, "create_subprocess_exec", replacement)
+    instance, lease = tool()
+    result = await instance.execute({"code": 'text("not run")'})
+    assert not result.success and result.error["code"] == "protocol_error"
+    assert result.output["calls"] == [] and lease.calls == []
+    assert MEDIA_NAMESPACE not in result.output and lease.closed
+
+
+async def test_duplicate_ack_fails_without_erasing_already_acknowledged_delivery(
+    monkeypatch, tmp_path
+):
+    from amplifier_module_tool_exec import runner
+
+    worker = tmp_path / "duplicate_ack.py"
+    worker.write_text(
+        "import json, sys\n"
+        "json.loads(sys.stdin.readline())\n"
+        "print(json.dumps({'type':'call','request_id':'1','name':'read','arguments':{}}), flush=True)\n"
+        "json.loads(sys.stdin.readline())\n"
+        "for _ in range(2):\n"
+        "    print(json.dumps({'type':'result_received','request_id':'1'}), flush=True)\n"
+    )
+    original = asyncio.create_subprocess_exec
+
+    async def replacement(*args, **kwargs):
+        return await original(args[0], "-I", str(worker), **kwargs)
+
+    async def returned(*_):
+        return {"status": "completed", "success": True, "output": media_output(media_ref())}
+
+    monkeypatch.setattr(runner.asyncio, "create_subprocess_exec", replacement)
+    instance, lease = tool(lease=Lease(returned))
+    result = await instance.execute({"code": "await tools.read({})"})
+    assert not result.success and result.error["code"] == "protocol_error"
+    assert result.output[MEDIA_NAMESPACE] == {"refs": [media_ref()]}
+    receipt, = result.output["calls"]
+    assert receipt["status"] == "completed" and receipt["success"] is True
+    assert receipt["result_delivery"] == "delivered"
+    assert len(lease.calls) == 1 and lease.closed
+
+
+async def test_javascript_bridge_cannot_forge_acknowledgement_or_replace_reply_bookkeeping():
+    async def returned(*_):
+        return {"status": "completed", "success": True, "output": media_output(media_ref())}
+
+    instance, _ = tool(lease=Lease(returned))
+    result = await instance.execute({"code": """
+        Map.prototype.get = () => {throw new Error("untrusted Map.get");};
+        Map.prototype.set = () => {throw new Error("untrusted Map.set");};
+        Map.prototype.delete = () => {throw new Error("untrusted Map.delete");};
+        globalThis.Promise = function() {throw new Error("untrusted Promise");};
+        text({type:"result_received", request_id:"forged"});
+        const response = await tools.read({});
+        text(response.status);
+        text([typeof _host_send, typeof __reply, typeof _host_finish]);
+    """})
+    assert result.success
+    assert result.output["calls"][0]["result_delivery"] == "delivered"
+    assert result.output[MEDIA_NAMESPACE] == {"refs": [media_ref()]}
+    assert result.output["output"][-2:] == [
+        "completed", '["undefined","undefined","undefined"]',
+    ]
+
+
+@pytest.mark.parametrize("thenable", [
+    'get() {throw new Error("untrusted inherited then");}',
+    'value: function() {}',
+])
+async def test_inherited_thenable_cannot_prevent_reply_fulfillment(thenable):
+    async def returned(*_):
+        return {"status": "completed", "success": True, "output": media_output(media_ref())}
+
+    instance, _ = tool({"timeout_seconds": 0.5}, Lease(returned))
+    result = await instance.execute({"code": f"""
+        Object.defineProperty(Object.prototype, "then", {{{thenable}, configurable: true}});
+        const response = await tools.read({{}});
+        delete Object.prototype.then;
+        text(response.status);
+    """})
+    assert result.success
+    assert result.output["output"] == ["completed"]
+    assert result.output["calls"][0]["result_delivery"] == "delivered"
+    assert result.output[MEDIA_NAMESPACE] == {"refs": [media_ref()]}
+
+
+async def test_transport_failure_after_ack_preserves_delivery_and_truthful_diagnostic(monkeypatch):
+    from amplifier_module_tool_exec import runner
+
+    original = asyncio.create_subprocess_exec
+    continuation_seen = asyncio.Event()
+
+    class ObserveContinuation:
+        def __init__(self, stream):
+            self.stream = stream
+
+        async def readline(self):
+            line = await self.stream.readline()
+            if b"after acknowledgement" in line:
+                continuation_seen.set()
+            return line
+
+    class LateDrainFailure:
+        def __init__(self, stream):
+            self.stream = stream
+            self.writes = 0
+
+        def write(self, value):
+            self.writes += 1
+            self.stream.write(value)
+
+        async def drain(self):
+            await self.stream.drain()
+            if self.writes > 1:
+                # The worker has emitted ACK and run the awaiting script before
+                # the parent's drain fails. Delivery evidence must not regress.
+                await continuation_seen.wait()
+                raise BrokenPipeError("synthetic late drain failure")
+
+    async def replacement(*args, **kwargs):
+        process = await original(*args, **kwargs)
+        process.stdin = LateDrainFailure(process.stdin)
+        process.stdout = ObserveContinuation(process.stdout)
+        return process
+
+    async def returned(*_):
+        return {"status": "completed", "success": True, "output": media_output(media_ref())}
+
+    monkeypatch.setattr(runner.asyncio, "create_subprocess_exec", replacement)
+    instance, lease = tool(lease=Lease(returned))
+    result = await instance.execute({
+        "code": 'await tools.read({}); text("after acknowledgement");'
+    })
+    assert not result.success and result.error["code"] == "worker_transport_failed"
+    assert "after acknowledged" in result.error["message"]
+    assert result.output[MEDIA_NAMESPACE] == {"refs": [media_ref()]}
+    receipt, = result.output["calls"]
+    assert receipt["status"] == "completed" and receipt["success"] is True
+    assert receipt["result_delivery"] == "delivered"
+    assert len(lease.calls) == 1 and lease.closed
+
+
 @pytest.mark.parametrize("change", [
     {"data": "PIXEL_SENTINEL"},
     {"v": True}, {"v": 2}, {"bytes": True}, {"height": 0},

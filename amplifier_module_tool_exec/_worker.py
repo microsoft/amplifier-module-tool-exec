@@ -19,12 +19,17 @@ BOOTSTRAP = r"""
   const finish = _host_finish;
   const stringify = JSON.stringify.bind(JSON);
   const parse = JSON.parse.bind(JSON);
+  const setPrototypeOf = Object.setPrototypeOf;
+  const CallPromise = Promise;
   const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
   const pending = new Map();
+  const pendingGet = pending.get.bind(pending);
+  const pendingSet = pending.set.bind(pending);
+  const pendingDelete = pending.delete.bind(pending);
   let nextId = 0;
-  const call = (name, args = {}) => new Promise((resolve, reject) => {
+  const call = (name, args = {}) => new CallPromise((resolve, reject) => {
     const id = String(++nextId);
-    pending.set(id, {resolve, reject});
+    pendingSet(id, {resolve, reject});
     send(stringify({type: "call", request_id: id, name, arguments: args}));
   });
   const text = value => send(stringify({type: "text", value: typeof value === "string" ? value : stringify(value)}));
@@ -41,10 +46,14 @@ BOOTSTRAP = r"""
   };
   globalThis.__reply = encoded => {
     const reply = parse(encoded);
-    const item = pending.get(reply.request_id);
-    if (!item) return;
-    pending.delete(reply.request_id);
+    const item = pendingGet(reply.request_id);
+    if (!item) return false;
+    pendingDelete(reply.request_id);
+    // Keep script-supplied Object.prototype.then from rejecting or indefinitely
+    // assimilating the host envelope instead of fulfilling the pending promise.
+    setPrototypeOf(reply.result, null);
     item.resolve(reply.result);
+    return true;
   };
   globalThis.__run = code => {
     Promise.resolve().then(() => new AsyncFunction("tools", "text", code)(tools, text)).then(
@@ -154,8 +163,14 @@ def main():
         if not line or len(line) > MAX_WIRE_BYTES:
             return 2
         response = json.loads(line)
-        outstanding.discard(response.get("request_id"))
-        reply(json.dumps(response))
+        identity = response.get("request_id")
+        if identity not in outstanding or reply(json.dumps(response)) is not True:
+            raise ValueError("Reply does not match an outstanding call")
+        outstanding.remove(identity)
+        # Only trusted Python emits this receipt, after QuickJS has parsed the
+        # response and resolved its pending call. JS bridge frames cannot ACK.
+        # Emit before executing promise continuations, which may themselves fail.
+        emit({"type": "result_received", "request_id": identity})
 
 
 if __name__ == "__main__":
