@@ -70,6 +70,37 @@ def tool(config=None, lease=None, capability=True):
     return ProgrammaticTool(coordinator, config), lease
 
 
+@pytest.mark.parametrize("max_code_bytes", [None, 4096, 131072])
+def test_schema_advertises_configured_code_byte_limit(max_code_bytes):
+    config = {} if max_code_bytes is None else {"max_code_bytes": max_code_bytes}
+    instance, _ = tool(config)
+    code_schema = instance.input_schema["properties"]["code"]
+    expected = 65536 if max_code_bytes is None else max_code_bytes
+    assert f"{expected} UTF-8 bytes" in code_schema["description"]
+    assert "top-level await" in code_schema["description"]
+    assert set(code_schema) == {"type", "description"}
+    assert "short" in instance.description
+    assert "large copied payloads" in instance.description
+    assert "repeated briefs" in instance.description
+
+
+@pytest.mark.parametrize("value", ["é", "𐐀"])
+@pytest.mark.parametrize("over_limit", [False, True])
+async def test_code_limit_counts_utf8_bytes_not_characters(value, over_limit):
+    code = f'text("{value}")'
+    limit = len(code.encode("utf-8")) - int(over_limit)
+    assert len(code) <= limit
+    instance, lease = tool({"max_code_bytes": limit})
+    result = await instance.execute({"code": code})
+    assert result.success is not over_limit
+    if over_limit:
+        assert result.error["code"] == "invalid_input"
+        assert lease.calls == [] and not lease.closed
+    else:
+        assert result.output["output"] == [value]
+        assert lease.closed
+
+
 async def test_no_dispatch_fails_closed_before_starting_worker(monkeypatch):
     instance, lease = tool(capability=False)
 

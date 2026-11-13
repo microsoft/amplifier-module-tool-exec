@@ -76,7 +76,8 @@ class ExecutionFailure(Exception):
 class ProgrammaticTool:
     name = "tool_exec"
     description = (
-        "Run bounded JavaScript over approved tools. Use await tools.NAME(arguments) "
+        "Run short, bounded JavaScript over approved tools; avoid large copied payloads "
+        "or repeated briefs. Use await tools.NAME(arguments) "
         "or tools.call(name, arguments), Promise.all for independent calls, and text(value) "
         "to return selected output. tools.available lists names. Each call returns "
         "{status, success, output, source}. No Node, filesystem, network, or persistent state. "
@@ -102,7 +103,10 @@ class ProgrammaticTool:
             "properties": {
                 "code": {
                     "type": "string",
-                    "description": "JavaScript body; top-level await is supported",
+                    "description": (
+                        "JavaScript body; top-level await is supported. "
+                        f"Configured maximum: {self.limits.max_code_bytes} UTF-8 bytes."
+                    ),
                 }
             },
             "required": ["code"],
