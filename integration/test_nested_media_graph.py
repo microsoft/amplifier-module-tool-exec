@@ -179,7 +179,7 @@ class ParticipantLoader:
             elif module_id == "test-memory-context":
                 await current.mount("context", self.context)
             elif module_id == "tool-exec":
-                await current.mount("tools", ProgrammaticTool(current), name="tool_exec")
+                await current.mount("tools", ProgrammaticTool(current, config), name="tool_exec")
             elif module_id == "test-images":
                 await current.mount("tools", self.images, name="read")
             else:
@@ -209,6 +209,8 @@ async def execute_graph(tmp_path, *, image_format="PNG", outer="retain", child="
         text("two bounded observations");
     """
     raw = OfflineTransport(code)
+    if child.endswith("not-delivered"):
+        exec_config = {"memory_bytes": 2 * 1024 * 1024}
     session = AmplifierSession({
         "session": {
             "orchestrator": {"module": "loop-streaming", "config": {
@@ -217,7 +219,10 @@ async def execute_graph(tmp_path, *, image_format="PNG", outer="retain", child="
             }},
             "context": "test-memory-context",
         },
-        "providers": [], "tools": [{"module": "tool-exec"}, {"module": "test-images"}],
+        "providers": [], "tools": [
+            {"module": "tool-exec", "config": exec_config or {}},
+            {"module": "test-images"},
+        ],
     }, session_id="nested-actual-graph")
     coordinator = session.coordinator
     coordinator.loader = ParticipantLoader(context, images)
@@ -336,11 +341,6 @@ async def execute_graph(tmp_path, *, image_format="PNG", outer="retain", child="
     try:
         await session.initialize()
         host = graph.participant("host.offline")
-        if child.endswith("not-delivered"):
-            exec_config = {"memory_bytes": 2 * 1024 * 1024}
-        if exec_config:
-            # Replace through the declared participant before sealing the graph.
-            await host.mount("tools", ProgrammaticTool(host, exec_config), name="tool_exec")
         await host.mount("providers", provider, name="offline")
         host.hooks.register("tool:pre", pre_policy, name="offline-child-admission")
         host.hooks.register("tool:post", before_policy, priority=0, name="offline-capture-input")
