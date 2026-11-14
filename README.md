@@ -161,6 +161,41 @@ unknown/denied outcomes, and cancellation. They do not establish any application
 UI acceptance or live model behavior. Hosts must separately prove lease expiration,
 real approvals, nested attribution, and cancellation through their actual dispatch
 implementation before enabling it for users.
+
+### Explicit candidate-graph integration
+
+`integration/test_nested_media_graph.py` is separate from the Core-only default
+suite. It exercises real `tools.dispatch`, real QuickJS receive acknowledgements,
+the public cooperating Core hook graph, real Foundation storage and source-bound
+checkpoint receipts, and private count/send projection. PNG/JPEG outer redaction,
+mixed child outcomes and count-to-send tampering are covered. Context, image
+producer and transport are declared offline test participants, not vendor
+inference or an application's registration graph.
+
+Use Python 3.13+, Core 2.0.2, Pillow, pytest/pytest-asyncio and the existing locked
+QuickJS worker environment. Export the selected committed Foundation package,
+streaming package and positive bridge module with `git archive` into distinct
+source directories; do not import moving source worktrees or hand-edit the
+exports. Then run:
+
+```sh
+python scripts/check_nested_media_graph.py \
+  --foundation-repo /path/to/foundation --foundation-commit FULL_SHA \
+  --foundation-source /path/to/foundation-export \
+  --streaming-repo /path/to/streaming --streaming-commit FULL_SHA \
+  --streaming-source /path/to/streaming-export \
+  --bridge-repo /path/to/foundation-bridge --bridge-commit FULL_SHA \
+  --bridge-source /path/to/bridge-export --receipt /path/to/new-receipt.json
+```
+
+The harness checks exported Python files against exact Git objects, verifies
+loaded participant-module paths and hashes, and records the test outcomes and
+isolated worker's actual QuickJS version. It does not install or fetch dependencies.
+An older bridge without `begin_participating_graph` fails; there is no private
+witness or synthetic `complete=True` fallback. Candidate proof does not waive
+accepted-upstream pairing, affected installed/shared-DTU qualification or
+independent review, and never authorizes merge, release or live adoption.
+
 ## Contributing
 
 > [!NOTE]
