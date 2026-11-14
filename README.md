@@ -2,9 +2,9 @@
 
 `tool-exec` mounts the `tool_exec` tool. It runs a fresh, bounded JavaScript program
 that calls already-mounted tools through the host's **approved dispatch lease**.
-Only explicit `text()` output and an authoritative call receipt list return to the
-model. This is useful when a task needs selected fields from several large tool
-results.
+Explicit `text()` output, an authoritative call receipt list, and eligible
+structured media references return to the model. This is useful when a task needs
+selected fields from several large tool results.
 
 ```javascript
 const results = await Promise.all([
@@ -91,15 +91,44 @@ also includes a stable `error.code` and message. Examples include
 completely. `output_limit` means printing exceeded the configured budget; it does
 not change a confirmed child outcome into unknown. `calls[].result_delivery`
 reports delivery to JavaScript (`delivered`, `omitted_limit`, or `failed`),
-separately from the host-confirmed `status` and `success`. A transport or encoding
-failure after a confirmed host outcome uses `result_delivery_failed` and preserves
-that outcome. The outer program still fails when its output is incomplete: do not
-use partial printed text as complete evidence.
+separately from the host-confirmed `status` and `success`. `delivered` requires a
+trusted worker acknowledgement after QuickJS parses the reply and resolves its
+pending call, not merely a successful pipe write. A transport, encoding or
+receive-side ingestion failure after a confirmed host outcome uses
+`result_delivery_failed` and preserves that outcome. Missing acknowledgement on
+timeout or cancellation also prevents delivery/media promotion, without changing
+the timeout/cancellation reason. A transport failure after acknowledgement uses
+`worker_transport_failed` and does not revoke delivered evidence. The outer program
+still fails when its output is incomplete: do not use partial printed text as
+complete evidence.
 
 Recover by reading an existing domain receipt or paging a read and selecting the
 needed fields. Never rerun a mutation solely to print a smaller result. This module
 does not add a persistent result store; host/domain receipts remain the recovery
 authority, and genuinely uncertain execution remains unknown.
+
+### Structured media references
+
+For media-aware hosts, the tool also aggregates direct
+`output["experimental.media.v1"] = {"refs": [...]}` carriers from the actual
+post-hook nested dispatch response into its own `ToolResult.output` namespace.
+Only confirmed successful calls whose bounded result was delivered to JavaScript
+contribute refs. Order and multiplicity follow invocation order, not completion
+order. No `text()` call is required; strings that look like JSON, nested dictionaries
+and printed text are never searched for media.
+
+The carrier accepts the closed session-owned v1 PNG/JPEG reference shape, not
+pixels, URLs or filesystem paths. A malformed reserved carrier fails result
+delivery with `invalid_media_result` without changing the confirmed child outcome.
+The existing nested-result byte budgets include refs; oversized or undeliverable
+results do not contribute them. Successful returned refs survive a later script,
+text-output or host-cancellation failure independently of `output_delivery`.
+Caller task cancellation still propagates rather than fabricating a result.
+
+The module does not resolve, hydrate, publish or commit media, refresh expiry, or
+grant access. Hosts must validate ownership and the effective nested result; the
+outer `tool:post` chain may still redact the aggregate before canonical acceptance.
+See the [dispatch contract](docs/dispatch-contract.md) for the integration boundary.
 
 Caller cancellation delivered to this tool propagates. An optional host lease
 `wait_cancelled()` signal also stops execution when the real host immediate-cancel
@@ -132,6 +161,41 @@ unknown/denied outcomes, and cancellation. They do not establish any application
 UI acceptance or live model behavior. Hosts must separately prove lease expiration,
 real approvals, nested attribution, and cancellation through their actual dispatch
 implementation before enabling it for users.
+
+### Explicit candidate-graph integration
+
+`integration/test_nested_media_graph.py` is separate from the Core-only default
+suite. It exercises real `tools.dispatch`, real QuickJS receive acknowledgements,
+the public cooperating Core hook graph, real Foundation storage and source-bound
+checkpoint receipts, and private count/send projection. PNG/JPEG outer redaction,
+mixed child outcomes and count-to-send tampering are covered. Context, image
+producer and transport are declared offline test participants, not vendor
+inference or an application's registration graph.
+
+Use Python 3.13+, Core 2.0.2, Pillow, pytest/pytest-asyncio and the existing locked
+QuickJS worker environment. Export the selected committed Foundation package,
+streaming package and positive bridge module with `git archive` into distinct
+source directories; do not import moving source worktrees or hand-edit the
+exports. Then run:
+
+```sh
+python scripts/check_nested_media_graph.py \
+  --foundation-repo /path/to/foundation --foundation-commit FULL_SHA \
+  --foundation-source /path/to/foundation-export \
+  --streaming-repo /path/to/streaming --streaming-commit FULL_SHA \
+  --streaming-source /path/to/streaming-export \
+  --bridge-repo /path/to/foundation-bridge --bridge-commit FULL_SHA \
+  --bridge-source /path/to/bridge-export --receipt /path/to/new-receipt.json
+```
+
+The harness checks exported Python files against exact Git objects, verifies
+loaded participant-module paths and hashes, and records the test outcomes and
+isolated worker's actual QuickJS version. It does not install or fetch dependencies.
+An older bridge without `begin_participating_graph` fails; there is no private
+witness or synthetic `complete=True` fallback. Candidate proof does not waive
+accepted-upstream pairing, affected installed/shared-DTU qualification or
+independent review, and never authorizes merge, release or live adoption.
+
 ## Contributing
 
 > [!NOTE]

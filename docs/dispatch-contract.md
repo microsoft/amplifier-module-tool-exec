@@ -89,3 +89,48 @@ host immediate-cancellation signal or lease/run/activation revocation. The modul
 races this signal against worker output and its deadline. Do not claim that merely
 cancelling an outer awaiter proves underlying work stopped. Preserve ordinary
 graceful-cancellation semantics; already-completed results remain completed.
+
+## Optional structured media result carrier
+
+When a media-aware host returns refs, `output` must be the actual effective
+post-hook `ToolResult.output` mapping, with the direct reserved member
+`"experimental.media.v1": {"refs": [SessionBlobRefV1, ...]}`. Explicit null,
+replacement without refs and in-place redaction must not fall back to the original
+producer output. Never return original refs beside a redacted effective output.
+Text containing this spelling is still text, not a carrier.
+
+Tool-exec aggregates only attributed `completed` / `success: true` responses
+successfully delivered within the existing result byte limits. Delivery is
+acknowledged by the trusted worker after QuickJS reply parsing and pending-call
+resolution, before script continuations run. A successful pipe drain alone is
+not delivery. Missing acknowledgement prevents promotion, preserves confirmed
+child outcomes and records failed result delivery. A later script failure after
+acknowledgement does not undo delivery. The script cannot emit acknowledgements
+through its call/text bridge; duplicate or unmatched acknowledgements fail closed.
+The top-level returned envelope has a null prototype so script-modified inherited
+thenables cannot intercept promise fulfillment; its JSON fields remain unchanged.
+Acknowledgement is result delivery, not proof the script used every field or saw
+pixels. Tool-exec snapshots the bounded wire data outside JavaScript, preserving
+ref order, inner provenance and
+original expiry. Failed, denied, unknown, oversized and undeliverable responses
+cannot contribute refs, even if the script prints success. Later program failure
+does not erase refs from completed delivered siblings or change their statuses.
+
+The closed v1 ref has exactly `v`, `session_id`, `sha256`, `mime`, `bytes`, `width`,
+`height`, and `provenance`. `v` is integer 1, the owner is the lease session, the
+digest is 64 lowercase hex characters, MIME is PNG/JPEG, and size/dimensions are
+positive non-boolean integers. Provenance has exactly `kind`, `session_id`, `id`,
+`created_at`, `expires_at`; both session IDs use the session-store identifier shape,
+kind is tool/upload/host/migration, the origin ID is nonempty, timestamps are
+timezone-qualified, and expiry is null or no earlier than creation. Unknown fields
+(including pixel payload fields), versions and malformed envelopes are refused,
+not silently sanitized. This structural check is not storage authorization.
+
+The host remains responsible for validating staged/accepted identity, policy,
+ownership and expiry through its session-bound media capability. In particular,
+the final **outer** post-hook/publication path must validate surviving nested
+origins without rebinding them to the outer call or extending their expiry; it may
+remove refs. Tool-exec adds no media capability imports, storage, resolution,
+inference, dispatch authority or checkpoint API. A host must qualify its nested
+dispatch and outer publication pairing before enabling media producers. The
+module's synthetic lease fixtures alone are not that cross-repository proof.
